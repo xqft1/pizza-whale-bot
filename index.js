@@ -19,7 +19,7 @@ if (!BOT_TOKEN || !CHAT_ID || !RPC_URL) {
   throw new Error("Missing BOT_TOKEN, CHAT_ID or RPC_URL in .env");
 }
 
-const provider = new ethers.JsonRpcProvider(RPC_URL);
+const provider = new ethers.WebSocketProvider(RPC_URL);
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
 const pairAbi = [
