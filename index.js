@@ -6,9 +6,14 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const RPC_URL = process.env.RPC_URL;
 
-const PIZZA_TOKEN = "0x831A3962e31037cf4Eb8847cb7eA05aaC1Db35B6";
-const SATO_TOKEN = "0x829f4B62EEBE12Af653b4dD4fFc480966F7d7f09";
-const PAIR_ADDRESS = "0x390B5EADf8192840b784228E5c712f298c7c2DC8";
+const PIZZA_TOKEN =
+  "0x831A3962e31037cf4Eb8847cb7eA05aaC1Db35B6";
+
+const SATO_TOKEN =
+  "0x829f4B62EEBE12Af653b4dD4fFc480966F7d7f09";
+
+const PAIR_ADDRESS =
+  "0x390B5EADf8192840b784228E5c712f298c7c2DC8";
 
 const DEXSCREENER_URL =
   "https://dexscreener.com/ethereum/0x390B5EADf8192840b784228E5c712f298c7c2DC8";
@@ -23,14 +28,27 @@ let cachedSatoUsdPrice = null;
 let cachedPriceTime = 0;
 
 if (!BOT_TOKEN || !CHAT_ID || !RPC_URL) {
-  throw new Error("Missing BOT_TOKEN, CHAT_ID or RPC_URL in .env");
+  throw new Error(
+    "Missing BOT_TOKEN, CHAT_ID or RPC_URL in environment variables"
+  );
 }
 
+/* =========================================================
+   PROVIDER + TELEGRAM
+========================================================= */
+
 const provider = new ethers.WebSocketProvider(RPC_URL);
-const bot = new TelegramBot(BOT_TOKEN, { polling: false });
+
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: false,
+});
+
+/* =========================================================
+   ABIs
+========================================================= */
 
 const pairAbi = [
-  "event Swap(address indexed sender,uint amount0In,uint amount1In,uint amount0Out,uint amount1Out,address indexed to)",
+  "event Swap(address indexed sender,uint256 amount0In,uint256 amount1In,uint256 amount0Out,uint256 amount1Out,address indexed to)",
   "function token0() view returns (address)",
   "function token1() view returns (address)",
 ];
@@ -39,9 +57,31 @@ const erc20Abi = [
   "function decimals() view returns (uint8)",
 ];
 
-const pair = new ethers.Contract(PAIR_ADDRESS, pairAbi, provider);
-const pizza = new ethers.Contract(PIZZA_TOKEN, erc20Abi, provider);
-const sato = new ethers.Contract(SATO_TOKEN, erc20Abi, provider);
+/* =========================================================
+   CONTRACTS
+========================================================= */
+
+const pair = new ethers.Contract(
+  PAIR_ADDRESS,
+  pairAbi,
+  provider
+);
+
+const pizza = new ethers.Contract(
+  PIZZA_TOKEN,
+  erc20Abi,
+  provider
+);
+
+const sato = new ethers.Contract(
+  SATO_TOKEN,
+  erc20Abi,
+  provider
+);
+
+/* =========================================================
+   HELPERS
+========================================================= */
 
 const shortAddress = (addr) =>
   `${addr.slice(0, 6)}...${addr.slice(-4)}`;
@@ -52,11 +92,24 @@ const formatNum = (num, maxDecimals = 2) =>
   });
 
 const getTier = (usdValue) => {
-  if (usdValue >= 500) return "👑🍕 PIZZA LEGEND ALERT";
-  if (usdValue >= 100) return "🐋🍕 PIZZA WHALE ALERT";
-  if (usdValue >= 25) return "🦈🍕 PIZZA SHARK ALERT";
+  if (usdValue >= 500) {
+    return "👑🍕 PIZZA LEGEND ALERT";
+  }
+
+  if (usdValue >= 100) {
+    return "🐋🍕 PIZZA WHALE ALERT";
+  }
+
+  if (usdValue >= 25) {
+    return "🦈🍕 PIZZA SHARK ALERT";
+  }
+
   return "🍕🔥 FRESH PIZZA BUY";
 };
+
+/* =========================================================
+   SATO PRICE
+========================================================= */
 
 async function getSatoUsdPrice() {
   const now = Date.now();
@@ -67,6 +120,8 @@ async function getSatoUsdPrice() {
   ) {
     return cachedSatoUsdPrice;
   }
+
+  console.log("💲 Fetching SATO USD price...");
 
   const response = await fetch(
     `https://api.dexscreener.com/latest/dex/tokens/${SATO_TOKEN}`
@@ -79,6 +134,7 @@ async function getSatoUsdPrice() {
   }
 
   const data = await response.json();
+
   const pairs = data.pairs || [];
 
   const bestPair = pairs
@@ -94,30 +150,140 @@ async function getSatoUsdPrice() {
     )[0];
 
   if (!bestPair) {
-    throw new Error("Could not determine SATO USD price");
+    throw new Error(
+      "Could not determine SATO USD price"
+    );
   }
 
-  cachedSatoUsdPrice = Number(bestPair.priceUsd);
+  cachedSatoUsdPrice =
+    Number(bestPair.priceUsd);
+
   cachedPriceTime = now;
 
   console.log(
-    "Updated SATO price:",
+    "💲 Updated SATO price:",
     `$${cachedSatoUsdPrice}`
   );
 
   return cachedSatoUsdPrice;
 }
 
+/* =========================================================
+   MAIN
+========================================================= */
+
 async function main() {
-  const token0 = (await pair.token0()).toLowerCase();
-  const token1 = (await pair.token1()).toLowerCase();
+  console.log("");
+  console.log(
+    "============================================"
+  );
+  console.log("🍕 PIZZA WHALE BOT STARTING");
+  console.log(
+    "============================================"
+  );
 
-  const pizzaDecimals = await pizza.decimals();
-  const satoDecimals = await sato.decimals();
+  /*
+   * Make sure the provider can actually communicate
+   * with Ethereum before setting up the listener.
+   */
 
+  const network = await provider.getNetwork();
+
+  console.log(
+    "🌐 Connected to chain:",
+    network.chainId.toString()
+  );
+
+  const startingBlock =
+    await provider.getBlockNumber();
+
+  console.log(
+    "⛓️ Current Ethereum block:",
+    startingBlock
+  );
+
+  /* ---------------------------------------------------------
+     PAIR INFORMATION
+  --------------------------------------------------------- */
+
+  const token0 =
+    (await pair.token0()).toLowerCase();
+
+  const token1 =
+    (await pair.token1()).toLowerCase();
+
+  const pizzaDecimals =
+    await pizza.decimals();
+
+  const satoDecimals =
+    await sato.decimals();
+
+  console.log("");
   console.log("🍕 Pizza Whale Alert bot running...");
-  console.log("Watching pair:", PAIR_ADDRESS);
-  console.log("Minimum alert: $", MIN_USD_BUY);
+  console.log(
+    "👀 Watching pair:",
+    PAIR_ADDRESS
+  );
+
+  console.log(
+    "🪙 token0:",
+    token0
+  );
+
+  console.log(
+    "🪙 token1:",
+    token1
+  );
+
+  console.log(
+    "🍕 PIZZA decimals:",
+    pizzaDecimals.toString()
+  );
+
+  console.log(
+    "💰 SATO decimals:",
+    satoDecimals.toString()
+  );
+
+  console.log(
+    "🚨 Minimum alert:",
+    `$${MIN_USD_BUY}`
+  );
+
+  /* =========================================================
+     BLOCK HEARTBEAT
+
+     If these stop appearing, the WebSocket subscription
+     has stopped receiving Ethereum events.
+  ========================================================= */
+
+  provider.on(
+    "block",
+    (blockNumber) => {
+      console.log(
+        "❤️ Block received:",
+        blockNumber
+      );
+    }
+  );
+
+  /* =========================================================
+     PROVIDER ERROR LOGGING
+  ========================================================= */
+
+  provider.on(
+    "error",
+    (error) => {
+      console.error(
+        "❌ PROVIDER ERROR:",
+        error
+      );
+    }
+  );
+
+  /* =========================================================
+     SWAP LISTENER
+  ========================================================= */
 
   pair.on(
     "Swap",
@@ -130,62 +296,183 @@ async function main() {
       to,
       event
     ) => {
+      /*
+       * IMPORTANT:
+       * This prints for EVERY swap on the pair, even if
+       * the swap is below $5 or is a PIZZA sell.
+       */
+
+      console.log("");
+      console.log(
+        "============================================"
+      );
+
+      console.log(
+        "🔔 RAW SWAP EVENT RECEIVED"
+      );
+
       try {
+        const txHash =
+          event.log.transactionHash;
+
+        console.log(
+          "TX:",
+          txHash
+        );
+
+        console.log(
+          "Sender:",
+          sender
+        );
+
+        console.log(
+          "To:",
+          to
+        );
+
+        console.log(
+          "amount0In:",
+          amount0In.toString()
+        );
+
+        console.log(
+          "amount1In:",
+          amount1In.toString()
+        );
+
+        console.log(
+          "amount0Out:",
+          amount0Out.toString()
+        );
+
+        console.log(
+          "amount1Out:",
+          amount1Out.toString()
+        );
+
         let pizzaBought = 0;
         let satoSpent = 0;
 
-        // PIZZA is token0
-        if (token0 === PIZZA_TOKEN.toLowerCase()) {
-          pizzaBought = Number(
-            ethers.formatUnits(
-              amount0Out,
-              pizzaDecimals
-            )
-          );
+        /* -----------------------------------------------------
+           PIZZA = TOKEN0
+        ----------------------------------------------------- */
 
-          satoSpent = Number(
-            ethers.formatUnits(
-              amount1In,
-              satoDecimals
-            )
-          );
+        if (
+          token0 ===
+          PIZZA_TOKEN.toLowerCase()
+        ) {
+          pizzaBought =
+            Number(
+              ethers.formatUnits(
+                amount0Out,
+                pizzaDecimals
+              )
+            );
+
+          satoSpent =
+            Number(
+              ethers.formatUnits(
+                amount1In,
+                satoDecimals
+              )
+            );
         }
 
-        // PIZZA is token1
-        if (token1 === PIZZA_TOKEN.toLowerCase()) {
-          pizzaBought = Number(
-            ethers.formatUnits(
-              amount1Out,
-              pizzaDecimals
-            )
-          );
+        /* -----------------------------------------------------
+           PIZZA = TOKEN1
+        ----------------------------------------------------- */
 
-          satoSpent = Number(
-            ethers.formatUnits(
-              amount0In,
-              satoDecimals
-            )
-          );
+        if (
+          token1 ===
+          PIZZA_TOKEN.toLowerCase()
+        ) {
+          pizzaBought =
+            Number(
+              ethers.formatUnits(
+                amount1Out,
+                pizzaDecimals
+              )
+            );
+
+          satoSpent =
+            Number(
+              ethers.formatUnits(
+                amount0In,
+                satoDecimals
+              )
+            );
         }
 
-        // Ignore sells
-        if (pizzaBought <= 0 || satoSpent <= 0) {
+        console.log(
+          "🍕 PIZZA bought:",
+          pizzaBought
+        );
+
+        console.log(
+          "💰 SATO spent:",
+          satoSpent
+        );
+
+        /* -----------------------------------------------------
+           IGNORE SELLS
+        ----------------------------------------------------- */
+
+        if (
+          pizzaBought <= 0 ||
+          satoSpent <= 0
+        ) {
+          console.log(
+            "⏭️ Ignored: not a PIZZA buy"
+          );
+
+          console.log(
+            "============================================"
+          );
+
           return;
         }
 
-        // Get current SATO USD price
-        const satoUsdPrice = await getSatoUsdPrice();
+        /* -----------------------------------------------------
+           GET USD VALUE
+        ----------------------------------------------------- */
 
-        // Calculate USD value of the buy
-        const usdValue = satoSpent * satoUsdPrice;
+        const satoUsdPrice =
+          await getSatoUsdPrice();
 
-        // Ignore buys below minimum USD threshold
-        if (usdValue < MIN_USD_BUY) {
+        const usdValue =
+          satoSpent *
+          satoUsdPrice;
+
+        console.log(
+          "💵 Estimated buy value:",
+          `$${usdValue.toFixed(2)}`
+        );
+
+        /* -----------------------------------------------------
+           MINIMUM BUY FILTER
+        ----------------------------------------------------- */
+
+        if (
+          usdValue <
+          MIN_USD_BUY
+        ) {
+          console.log(
+            `⏭️ Ignored: below $${MIN_USD_BUY} minimum`
+          );
+
+          console.log(
+            "============================================"
+          );
+
           return;
         }
 
-        const txHash = event.log.transactionHash;
-        const tier = getTier(usdValue);
+        /* -----------------------------------------------------
+           BUILD TELEGRAM ALERT
+        ----------------------------------------------------- */
+
+        const tier =
+          getTier(usdValue);
 
         const message = `
 ${tier}
@@ -206,27 +493,70 @@ ${DEXSCREENER_URL}
 https://etherscan.io/tx/${txHash}
 `;
 
+        /* -----------------------------------------------------
+           SEND TELEGRAM MESSAGE
+        ----------------------------------------------------- */
+
         await bot.sendMessage(
           CHAT_ID,
           message,
           {
-            disable_web_page_preview: false,
+            disable_web_page_preview:
+              false,
           }
         );
 
         console.log(
-          "Alert sent:",
-          txHash,
+          "🚨 TELEGRAM ALERT SENT"
+        );
+
+        console.log(
+          "TX:",
+          txHash
+        );
+
+        console.log(
+          "Value:",
           `$${usdValue.toFixed(2)}`
+        );
+
+        console.log(
+          "============================================"
         );
       } catch (err) {
         console.error(
-          "Swap handling error:",
+          "❌ SWAP HANDLING ERROR:",
           err
+        );
+
+        console.log(
+          "============================================"
         );
       }
     }
   );
+
+  console.log("");
+  console.log(
+    "👂 Swap listener registered."
+  );
+
+  console.log(
+    "❤️ Waiting for Ethereum blocks..."
+  );
+
+  console.log("");
 }
 
-main().catch(console.error);
+/* =========================================================
+   FATAL ERRORS
+========================================================= */
+
+main().catch((error) => {
+  console.error(
+    "❌ FATAL BOT ERROR:",
+    error
+  );
+
+  process.exit(1);
+});
