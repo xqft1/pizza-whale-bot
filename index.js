@@ -610,100 +610,55 @@ async function scanToBlock(
   pizzaDecimals,
   satoDecimals
 ) {
-  if (
-    lastProcessedBlock === null
-  ) {
+  if (lastProcessedBlock === null) {
     return;
   }
 
-  /*
-   * IMPORTANT:
-   *
-   * DO NOT scan the newest Ethereum block.
-   *
-   * We wait 3 blocks before considering
-   * a block safe to scan.
-   *
-   * Example:
-   *
-   * Ethereum head = 1000
-   *
-   * Bot scans only through:
-   *
-   * 997
-   *
-   * This prevents RPC timing/race problems
-   * where a block is visible but its logs
-   * are not yet consistently available.
-   */
-
+  // Stay 3 blocks behind the Ethereum tip.
   const safeBlock =
-    latestBlock -
-    CONFIRMATIONS;
+    latestBlock - CONFIRMATIONS;
 
-  if (
-    safeBlock < 0
-  ) {
+  if (safeBlock < 0) {
     return;
   }
 
-  if (
-    safeBlock <=
-    lastProcessedBlock
-  ) {
+  if (safeBlock <= lastProcessedBlock) {
     return;
   }
 
-  /*
-   * Deliberately scan several blocks
-   * we've already checked.
-   *
-   * This is intentional.
-   *
-   * If the RPC somehow failed to return
-   * a log previously, we get another chance
-   * to find it.
-   *
-   * processedEvents prevents duplicate alerts.
-   */
+  // Rescan previous blocks for reliability.
+  let fromBlock = Math.max(
+    0,
+    lastProcessedBlock - RESCAN_BLOCKS + 1
+  );
 
-  let fromBlock =
-    Math.max(
-      0,
-      lastProcessedBlock -
-        RESCAN_BLOCKS +
-        1
+  while (fromBlock <= safeBlock) {
+
+    // FREE RPC LIMIT:
+    // Inclusive range of 10 blocks:
+    // 100 -> 109 = 10 blocks.
+    const toBlock = Math.min(
+      fromBlock + 9,
+      safeBlock
     );
-
-  while (
-    fromBlock <=
-    safeBlock
-  ) {
-    const toBlock =
-      Math.min(
-        fromBlock +
-          MAX_BLOCKS_PER_QUERY -
-          1,
-        safeBlock
-      );
 
     console.log(
       `🔎 Scanning CONFIRMED blocks ${fromBlock} -> ${toBlock}`
     );
 
     const logs =
-      await getSwapLogs(
+      await readProvider.getLogs({
+        address: PAIR_ADDRESS,
+        topics: [swapTopic],
         fromBlock,
-        toBlock
-      );
+        toBlock,
+      });
 
     console.log(
       `🔔 Found ${logs.length} raw swap log(s)`
     );
 
-    for (
-      const log of logs
-    ) {
+    for (const log of logs) {
       const event =
         parseSwapLog(log);
 
@@ -711,7 +666,6 @@ async function scanToBlock(
         console.log(
           "⏭️ Could not parse swap log"
         );
-
         continue;
       }
 
@@ -724,26 +678,10 @@ async function scanToBlock(
       );
     }
 
-    fromBlock =
-      toBlock + 1;
+    // Only after this 10-block batch succeeds
+    // do we move to the next batch.
+    fromBlock = toBlock + 1;
   }
-
-  /*
-   * CRITICAL:
-   *
-   * We ONLY move lastProcessedBlock
-   * after the complete scan succeeds.
-   *
-   * If:
-   *
-   * - RPC fails
-   * - DexScreener fails
-   * - Telegram fails
-   *
-   * execution never reaches this line.
-   *
-   * Therefore the blocks get retried.
-   */
 
   lastProcessedBlock =
     safeBlock;
