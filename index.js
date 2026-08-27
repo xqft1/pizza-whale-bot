@@ -18,29 +18,24 @@ const PAIR_ADDRESS =
 const DEXSCREENER_URL =
   "https://dexscreener.com/ethereum/0x390B5EADf8192840b784228E5c712f298c7c2DC8";
 
-// Minimum USD value required to trigger an alert
 const MIN_USD_BUY = 5;
-
-// Cache SATO price for 60 seconds
 const PRICE_CACHE_MS = 60_000;
-
-// Backup check in case a WebSocket block notification is missed
-const BLOCK_POLL_MS = 10_000;
-
-// Keep eth_getLogs requests small if the bot needs to catch up
+const BLOCK_POLL_MS = 8_000;
+const CONFIRMATIONS = 3;
+const RESCAN_BLOCKS = 6;
+const STARTUP_LOOKBACK_BLOCKS = 20;
 const MAX_BLOCKS_PER_QUERY = 100;
-
-// If RPC repeatedly dies, exit so Railway can restart the service
 const MAX_CONSECUTIVE_RPC_FAILURES = 5;
+const MAX_PROCESSED_EVENTS = 10_000;
 
 let cachedSatoUsdPrice = null;
 let cachedPriceTime = 0;
 
 let lastProcessedBlock = null;
 let scanQueue = Promise.resolve();
+let highestQueuedBlock = 0;
 let consecutiveRpcFailures = 0;
 
-// Prevent duplicate alerts while this process is running
 const processedEvents = new Set();
 
 if (!BOT_TOKEN || !CHAT_ID || !RPC_URL) {
@@ -50,10 +45,24 @@ if (!BOT_TOKEN || !CHAT_ID || !RPC_URL) {
 }
 
 /* =========================================================
-   PROVIDER + TELEGRAM
+   PROVIDERS + TELEGRAM
 ========================================================= */
 
-const provider = new ethers.WebSocketProvider(RPC_URL);
+// WebSocket = fast notification that Ethereum has a new block.
+const wsProvider = new ethers.WebSocketProvider(RPC_URL);
+
+// HTTP = independent provider for actually reading blocks/logs.
+//
+// This lets us receive a WebSocket notification but retrieve
+// the swap logs separately, rather than trusting one live
+// subscription to do everything.
+const HTTP_RPC_URL = RPC_URL
+  .replace(/^wss:\/\//i, "https://")
+  .replace(/^ws:\/\//i, "http://");
+
+const readProvider = new ethers.JsonRpcProvider(
+  HTTP_RPC_URL
+);
 
 const bot = new TelegramBot(BOT_TOKEN, {
   polling: false,
@@ -80,19 +89,23 @@ const erc20Abi = [
 const pair = new ethers.Contract(
   PAIR_ADDRESS,
   pairAbi,
-  provider
+  readProvider
 );
 
 const pizza = new ethers.Contract(
   PIZZA_TOKEN,
   erc20Abi,
-  provider
+  readProvider
 );
 
 const sato = new ethers.Contract(
   SATO_TOKEN,
   erc20Abi,
-  provider
+  readProvider
+);
+
+const swapTopic = ethers.id(
+  "Swap(address,uint256,uint256,uint256,uint256,address)"
 );
 
 /* =========================================================
@@ -124,7 +137,8 @@ const getTier = (usdValue) => {
 };
 
 const getEventId = (event) => {
-  const txHash = event.transactionHash;
+  const txHash =
+    event.transactionHash;
 
   const logIndex =
     event.index ??
@@ -133,6 +147,21 @@ const getEventId = (event) => {
 
   return `${txHash}:${logIndex}`;
 };
+
+function rememberProcessedEvent(eventId) {
+  processedEvents.add(eventId);
+
+  // Stop this Set growing forever.
+  if (
+    processedEvents.size >
+    MAX_PROCESSED_EVENTS
+  ) {
+    const oldest =
+      processedEvents.values().next().value;
+
+    processedEvents.delete(oldest);
+  }
+}
 
 /* =========================================================
    SATO PRICE
@@ -148,7 +177,9 @@ async function getSatoUsdPrice() {
     return cachedSatoUsdPrice;
   }
 
-  console.log("💲 Fetching SATO USD price...");
+  console.log(
+    "💲 Fetching SATO USD price..."
+  );
 
   const response = await fetch(
     `https://api.dexscreener.com/latest/dex/tokens/${SATO_TOKEN}`
@@ -160,9 +191,11 @@ async function getSatoUsdPrice() {
     );
   }
 
-  const data = await response.json();
+  const data =
+    await response.json();
 
-  const pairs = data.pairs || [];
+  const pairs =
+    data.pairs || [];
 
   const bestPair = pairs
     .filter(
@@ -172,8 +205,12 @@ async function getSatoUsdPrice() {
     )
     .sort(
       (a, b) =>
-        Number(b.liquidity?.usd || 0) -
-        Number(a.liquidity?.usd || 0)
+        Number(
+          b.liquidity?.usd || 0
+        ) -
+        Number(
+          a.liquidity?.usd || 0
+        )
     )[0];
 
   if (!bestPair) {
@@ -185,7 +222,8 @@ async function getSatoUsdPrice() {
   cachedSatoUsdPrice =
     Number(bestPair.priceUsd);
 
-  cachedPriceTime = now;
+  cachedPriceTime =
+    now;
 
   console.log(
     "💲 Updated SATO price:",
@@ -209,6 +247,11 @@ async function handleSwap(
   const eventId =
     getEventId(event);
 
+  /*
+   * Because we deliberately rescan old blocks,
+   * we need to stop the same transaction being
+   * announced multiple times.
+   */
   if (
     processedEvents.has(eventId)
   ) {
@@ -245,6 +288,11 @@ async function handleSwap(
   console.log(
     "TX:",
     txHash
+  );
+
+  console.log(
+    "Block:",
+    event.blockNumber
   );
 
   console.log(
@@ -340,9 +388,9 @@ async function handleSwap(
     satoSpent
   );
 
-  /* -----------------------------------------------------
+  /* =========================================================
      IGNORE SELLS
-  ----------------------------------------------------- */
+  ========================================================= */
 
   if (
     pizzaBought <= 0 ||
@@ -352,36 +400,64 @@ async function handleSwap(
       "⏭️ Ignored: not a PIZZA buy"
     );
 
-    console.log(
-      "============================================"
+    rememberProcessedEvent(
+      eventId
     );
 
-    processedEvents.add(
-      eventId
+    console.log(
+      "============================================"
     );
 
     return;
   }
 
-  /* -----------------------------------------------------
-     GET USD VALUE
-  ----------------------------------------------------- */
+  /* =========================================================
+     USD VALUE
+  ========================================================= */
 
-  const satoUsdPrice =
-    await getSatoUsdPrice();
+  let satoUsdPrice;
+
+  try {
+    satoUsdPrice =
+      await getSatoUsdPrice();
+  } catch (error) {
+    /*
+     * Do NOT mark this event processed.
+     *
+     * If DexScreener temporarily fails,
+     * throwing here prevents the scanner
+     * from advancing past the block.
+     *
+     * The block will therefore be retried.
+     */
+    console.error(
+      "❌ SATO PRICE ERROR:",
+      error
+    );
+
+    throw error;
+  }
 
   const usdValue =
     satoSpent *
     satoUsdPrice;
+
+  if (
+    !Number.isFinite(usdValue)
+  ) {
+    throw new Error(
+      `Invalid USD value for ${txHash}`
+    );
+  }
 
   console.log(
     "💵 Estimated buy value:",
     `$${usdValue.toFixed(2)}`
   );
 
-  /* -----------------------------------------------------
+  /* =========================================================
      MINIMUM BUY FILTER
-  ----------------------------------------------------- */
+  ========================================================= */
 
   if (
     usdValue <
@@ -391,20 +467,20 @@ async function handleSwap(
       `⏭️ Ignored: below $${MIN_USD_BUY} minimum`
     );
 
-    console.log(
-      "============================================"
+    rememberProcessedEvent(
+      eventId
     );
 
-    processedEvents.add(
-      eventId
+    console.log(
+      "============================================"
     );
 
     return;
   }
 
-  /* -----------------------------------------------------
-     BUILD TELEGRAM ALERT
-  ----------------------------------------------------- */
+  /* =========================================================
+     BUILD TELEGRAM MESSAGE
+  ========================================================= */
 
   const tier =
     getTier(usdValue);
@@ -428,9 +504,9 @@ ${DEXSCREENER_URL}
 https://etherscan.io/tx/${txHash}
 `;
 
-  /* -----------------------------------------------------
-     SEND TELEGRAM MESSAGE
-  ----------------------------------------------------- */
+  /* =========================================================
+     SEND TELEGRAM ALERT
+  ========================================================= */
 
   await bot.sendMessage(
     CHAT_ID,
@@ -441,9 +517,11 @@ https://etherscan.io/tx/${txHash}
     }
   );
 
-  // Only mark the event as processed
-  // after Telegram confirms the send.
-  processedEvents.add(
+  /*
+   * Only mark it processed AFTER
+   * Telegram confirms the message.
+   */
+  rememberProcessedEvent(
     eventId
   );
 
@@ -467,11 +545,66 @@ https://etherscan.io/tx/${txHash}
 }
 
 /* =========================================================
-   SCAN BLOCKS FOR SWAPS
+   FETCH RAW SWAP LOGS
+========================================================= */
+
+async function getSwapLogs(
+  fromBlock,
+  toBlock
+) {
+  return await readProvider.getLogs({
+    address:
+      PAIR_ADDRESS,
+
+    topics: [
+      swapTopic,
+    ],
+
+    fromBlock,
+    toBlock,
+  });
+}
+
+/* =========================================================
+   PARSE RAW SWAP LOG
+========================================================= */
+
+function parseSwapLog(log) {
+  const parsed =
+    pair.interface.parseLog(log);
+
+  if (!parsed) {
+    return null;
+  }
+
+  return {
+    args:
+      parsed.args,
+
+    transactionHash:
+      log.transactionHash,
+
+    blockNumber:
+      log.blockNumber,
+
+    index:
+      log.index ??
+      log.logIndex ??
+      0,
+
+    logIndex:
+      log.index ??
+      log.logIndex ??
+      0,
+  };
+}
+
+/* =========================================================
+   SCAN CONFIRMED BLOCKS
 ========================================================= */
 
 async function scanToBlock(
-  targetBlock,
+  latestBlock,
   token0,
   token1,
   pizzaDecimals,
@@ -483,46 +616,105 @@ async function scanToBlock(
     return;
   }
 
+  /*
+   * IMPORTANT:
+   *
+   * DO NOT scan the newest Ethereum block.
+   *
+   * We wait 3 blocks before considering
+   * a block safe to scan.
+   *
+   * Example:
+   *
+   * Ethereum head = 1000
+   *
+   * Bot scans only through:
+   *
+   * 997
+   *
+   * This prevents RPC timing/race problems
+   * where a block is visible but its logs
+   * are not yet consistently available.
+   */
+
+  const safeBlock =
+    latestBlock -
+    CONFIRMATIONS;
+
   if (
-    targetBlock <=
+    safeBlock < 0
+  ) {
+    return;
+  }
+
+  if (
+    safeBlock <=
     lastProcessedBlock
   ) {
     return;
   }
 
-  while (
-    lastProcessedBlock <
-    targetBlock
-  ) {
-    const fromBlock =
-      lastProcessedBlock + 1;
+  /*
+   * Deliberately scan several blocks
+   * we've already checked.
+   *
+   * This is intentional.
+   *
+   * If the RPC somehow failed to return
+   * a log previously, we get another chance
+   * to find it.
+   *
+   * processedEvents prevents duplicate alerts.
+   */
 
+  let fromBlock =
+    Math.max(
+      0,
+      lastProcessedBlock -
+        RESCAN_BLOCKS +
+        1
+    );
+
+  while (
+    fromBlock <=
+    safeBlock
+  ) {
     const toBlock =
       Math.min(
         fromBlock +
           MAX_BLOCKS_PER_QUERY -
           1,
-        targetBlock
+        safeBlock
       );
 
     console.log(
-      `🔎 Scanning blocks ${fromBlock} -> ${toBlock}`
+      `🔎 Scanning CONFIRMED blocks ${fromBlock} -> ${toBlock}`
     );
 
-    const events =
-      await pair.queryFilter(
-        pair.filters.Swap(),
+    const logs =
+      await getSwapLogs(
         fromBlock,
         toBlock
       );
 
     console.log(
-      `🔔 Found ${events.length} swap event(s)`
+      `🔔 Found ${logs.length} raw swap log(s)`
     );
 
     for (
-      const event of events
+      const log of logs
     ) {
+      const event =
+        parseSwapLog(log);
+
+      if (!event) {
+        console.log(
+          "⏭️ Could not parse swap log"
+        );
+
+        continue;
+      }
+
       await handleSwap(
         event,
         token0,
@@ -532,26 +724,34 @@ async function scanToBlock(
       );
     }
 
-    /*
-     * IMPORTANT:
-     * Only advance after every event
-     * in this block range was handled.
-     *
-     * If DexScreener, Telegram or the RPC
-     * throws an error, this line is not reached.
-     *
-     * The next scan will therefore retry
-     * the same missing block range.
-     */
-
-    lastProcessedBlock =
-      toBlock;
-
-    console.log(
-      "✅ Processed through block:",
-      lastProcessedBlock
-    );
+    fromBlock =
+      toBlock + 1;
   }
+
+  /*
+   * CRITICAL:
+   *
+   * We ONLY move lastProcessedBlock
+   * after the complete scan succeeds.
+   *
+   * If:
+   *
+   * - RPC fails
+   * - DexScreener fails
+   * - Telegram fails
+   *
+   * execution never reaches this line.
+   *
+   * Therefore the blocks get retried.
+   */
+
+  lastProcessedBlock =
+    safeBlock;
+
+  console.log(
+    "✅ Safely processed through block:",
+    lastProcessedBlock
+  );
 }
 
 /* =========================================================
@@ -559,30 +759,40 @@ async function scanToBlock(
 ========================================================= */
 
 function queueScan(
-  targetBlock,
+  latestBlock,
   token0,
   token1,
   pizzaDecimals,
   satoDecimals
 ) {
   /*
-   * Ethereum blocks can arrive while
-   * the previous block is still being checked.
+   * Keep track of the newest block we've seen.
    *
-   * The queue prevents two scans from
-   * modifying lastProcessedBlock simultaneously.
+   * If Ethereum produces another block while
+   * we're still scanning, we don't lose it.
    */
+
+  highestQueuedBlock =
+    Math.max(
+      highestQueuedBlock,
+      latestBlock
+    );
 
   scanQueue =
     scanQueue
-      .then(() =>
-        scanToBlock(
-          targetBlock,
-          token0,
-          token1,
-          pizzaDecimals,
-          satoDecimals
-        )
+      .then(
+        async () => {
+          const target =
+            highestQueuedBlock;
+
+          await scanToBlock(
+            target,
+            token0,
+            token1,
+            pizzaDecimals,
+            satoDecimals
+          );
+        }
       )
       .catch(
         (error) => {
@@ -597,10 +807,10 @@ function queueScan(
           );
 
           /*
-           * Do NOT move lastProcessedBlock.
+           * Do NOT advance lastProcessedBlock.
            *
-           * The next block event or
-           * backup poll will retry it.
+           * The next WebSocket block OR HTTP
+           * poll retries the range.
            */
         }
       );
@@ -625,30 +835,62 @@ async function main() {
     "============================================"
   );
 
-  /*
-   * Confirm Ethereum connectivity
-   */
+  /* =========================================================
+     TEST BOTH RPC CONNECTIONS
+  ========================================================= */
 
-  const network =
-    await provider.getNetwork();
+  const wsNetwork =
+    await wsProvider.getNetwork();
+
+  const readNetwork =
+    await readProvider.getNetwork();
+
+  if (
+    wsNetwork.chainId !==
+    readNetwork.chainId
+  ) {
+    throw new Error(
+      "WebSocket RPC and HTTP RPC are on different chains"
+    );
+  }
 
   console.log(
     "🌐 Connected to chain:",
-    network.chainId.toString()
+    wsNetwork.chainId.toString()
   );
 
-  /*
-   * Record where we are starting.
-   *
-   * We deliberately start at the current
-   * block so an old buy is not announced
-   * again when Railway redeploys.
-   */
+  console.log(
+    "🔌 WebSocket RPC ready"
+  );
+
+  console.log(
+    "📡 HTTP log RPC ready"
+  );
+
+  /* =========================================================
+     STARTING BLOCK
+  ========================================================= */
 
   const startingBlock =
-    await provider.getBlockNumber();
+    await readProvider.getBlockNumber();
+
+  /*
+   * IMPORTANT:
+   *
+   * Do NOT start exactly at the current block.
+   *
+   * Look back 20 blocks so a Railway
+   * restart/deployment cannot create a blind spot.
+   */
 
   lastProcessedBlock =
+    Math.max(
+      0,
+      startingBlock -
+        STARTUP_LOOKBACK_BLOCKS
+    );
+
+  highestQueuedBlock =
     startingBlock;
 
   console.log(
@@ -656,9 +898,14 @@ async function main() {
     startingBlock
   );
 
-  /* ---------------------------------------------------------
+  console.log(
+    "↩️ Startup lookback begins after block:",
+    lastProcessedBlock
+  );
+
+  /* =========================================================
      PAIR INFORMATION
-  --------------------------------------------------------- */
+  ========================================================= */
 
   const token0 =
     (
@@ -675,6 +922,33 @@ async function main() {
 
   const satoDecimals =
     await sato.decimals();
+
+  const pizzaLower =
+    PIZZA_TOKEN.toLowerCase();
+
+  const satoLower =
+    SATO_TOKEN.toLowerCase();
+
+  /*
+   * Fail immediately if PAIR_ADDRESS
+   * somehow isn't PIZZA/SATO.
+   */
+
+  const correctPair =
+    (
+      token0 === pizzaLower &&
+      token1 === satoLower
+    ) ||
+    (
+      token0 === satoLower &&
+      token1 === pizzaLower
+    );
+
+  if (!correctPair) {
+    throw new Error(
+      `PAIR_ADDRESS is not PIZZA/SATO. token0=${token0} token1=${token1}`
+    );
+  }
 
   console.log("");
 
@@ -713,15 +987,25 @@ async function main() {
   );
 
   console.log(
-    "🧱 Starting after block:",
-    lastProcessedBlock
+    "🛡️ Confirmations:",
+    CONFIRMATIONS
+  );
+
+  console.log(
+    "🔁 Rescan overlap:",
+    `${RESCAN_BLOCKS} blocks`
+  );
+
+  console.log(
+    "🛟 Startup lookback:",
+    `${STARTUP_LOOKBACK_BLOCKS} blocks`
   );
 
   /* =========================================================
-     BLOCK HEARTBEAT + PRIMARY SCAN TRIGGER
+     WEBSOCKET BLOCK NOTIFICATIONS
   ========================================================= */
 
-  provider.on(
+  wsProvider.on(
     "block",
     (blockNumber) => {
       console.log(
@@ -743,77 +1027,63 @@ async function main() {
   );
 
   /* =========================================================
-     PROVIDER ERROR LOGGING
+     WEBSOCKET ERRORS
   ========================================================= */
 
-  provider.on(
+  wsProvider.on(
     "error",
     (error) => {
       console.error(
-        "❌ PROVIDER ERROR:",
+        "❌ WEBSOCKET PROVIDER ERROR:",
         error
       );
     }
   );
 
   /* =========================================================
-     BACKUP BLOCK POLL
-
-     Even if WebSocket gives us block 100
-     and then skips straight to block 103,
-     scanToBlock() will query:
-
-     101
-     102
-     103
-
-     The poll also checks Ethereum every
-     10 seconds in case the block event
-     itself is missed.
+     INDEPENDENT HTTP BACKUP POLL
   ========================================================= */
+
+  /*
+   * Every 8 seconds we independently ask Ethereum:
+   *
+   * "What is the latest block?"
+   *
+   * Therefore even if the WebSocket silently stops
+   * delivering block events, the bot keeps scanning.
+   */
 
   setInterval(
     async () => {
       try {
         const latestBlock =
-          await provider.getBlockNumber();
+          await readProvider.getBlockNumber();
 
         consecutiveRpcFailures =
           0;
 
-        if (
-          lastProcessedBlock !==
-            null &&
-          latestBlock >
-            lastProcessedBlock
-        ) {
-          console.log(
-            "🛟 Poll found unprocessed block(s). Latest:",
-            latestBlock
-          );
-
-          queueScan(
-            latestBlock,
-            token0,
-            token1,
-            pizzaDecimals,
-            satoDecimals
-          );
-        }
+        queueScan(
+          latestBlock,
+          token0,
+          token1,
+          pizzaDecimals,
+          satoDecimals
+        );
       } catch (error) {
         consecutiveRpcFailures +=
           1;
 
         console.error(
-          `❌ RPC POLL ERROR (${consecutiveRpcFailures}/${MAX_CONSECUTIVE_RPC_FAILURES}):`,
+          `❌ HTTP RPC POLL ERROR (${consecutiveRpcFailures}/${MAX_CONSECUTIVE_RPC_FAILURES}):`,
           error
         );
 
         /*
-         * If the WebSocket/RPC connection
-         * has completely died, Railway
-         * restarting us is safer than
-         * leaving a zombie bot running.
+         * Don't leave a zombie Railway process
+         * running indefinitely.
+         *
+         * After repeated RPC failures, exit.
+         * Railway can then restart the bot.
          */
 
         if (
@@ -831,10 +1101,28 @@ async function main() {
     BLOCK_POLL_MS
   );
 
+  /* =========================================================
+     IMMEDIATE STARTUP CATCH-UP
+  ========================================================= */
+
+  /*
+   * Don't wait for the next Ethereum block.
+   *
+   * Immediately scan the startup lookback range.
+   */
+
+  queueScan(
+    startingBlock,
+    token0,
+    token1,
+    pizzaDecimals,
+    satoDecimals
+  );
+
   console.log("");
 
   console.log(
-    "👂 Block scanner registered."
+    "👂 Confirmed-block scanner registered."
   );
 
   console.log(
